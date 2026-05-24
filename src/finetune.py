@@ -306,9 +306,6 @@ def train(cfg: dict) -> None:
     # Build datasets
     aug = build_train_augmentation(cfg)
 
-    def frame_transform(frame, mask):
-        return aug([frame], [mask])[0][0], aug([frame], [mask])[1][0]
-
     train_dataset = DAVISFrameDataset(
         cfg["data"]["davis_root"],
         split=cfg["data"].get("train_split", "train"),
@@ -363,7 +360,9 @@ def train(cfg: dict) -> None:
     # LR scheduler: linear warmup → cosine annealing (optional)
     if use_scheduler:
         from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-        total_steps  = len(train_loader) * num_epochs
+        # total_steps must be in optimizer-step units (scheduler.step() is called
+        # once per optimizer step, i.e. every grad_accum samples).
+        total_steps  = (len(train_loader) * num_epochs) // grad_accum
         warmup_steps = train_cfg.get("warmup_steps", 100)
         warmup_sched = LinearLR(optimizer, start_factor=0.1, end_factor=1.0,
                                 total_iters=warmup_steps)
@@ -373,7 +372,7 @@ def train(cfg: dict) -> None:
         scheduler = SequentialLR(optimizer,
                                  schedulers=[warmup_sched, cosine_sched],
                                  milestones=[warmup_steps])
-        print(f"Scheduler: {warmup_steps} warmup steps → cosine decay over {total_steps} total steps.")
+        print(f"Scheduler: {warmup_steps} warmup steps → cosine decay over {total_steps} optimizer steps.")
     else:
         scheduler = None
         print("Constant LR (scheduler disabled).")
