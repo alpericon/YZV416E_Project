@@ -46,6 +46,18 @@ def parse_args():
     parser.add_argument("--compare-zero-shot", action="store_true", default=True,
                         help="Also run zero-shot eval and compare (default: true)")
     parser.add_argument("--no-compare", dest="compare_zero_shot", action="store_false")
+    parser.add_argument(
+        "--run-name", default="improved",
+        help="Label for this run; controls checkpoint and output subdirs (default: improved)"
+    )
+    parser.add_argument(
+        "--baseline", action="store_true",
+        help="Baseline run: constant LR, no boundary loss, no uncertainty weighting"
+    )
+    parser.add_argument(
+        "--no-uncertainty", dest="no_uncertainty", action="store_true",
+        help="Ablation: LR scheduler + boundary loss, but no uncertainty weighting"
+    )
     return parser.parse_args()
 
 
@@ -61,9 +73,30 @@ def main():
     if args.lr is not None:
         cfg.setdefault("training", {})["learning_rate"] = args.lr
 
+    # Run variant flags — determine feature set and resolve run name
+    run_name = args.run_name
+    t = cfg.setdefault("training", {})
+    if args.baseline:
+        run_name = run_name if run_name != "improved" else "baseline"
+        t["use_uncertainty"] = False
+        t["use_boundary"]    = False
+        t["use_scheduler"]   = False
+    elif args.no_uncertainty:
+        run_name = run_name if run_name != "improved" else "no_uncertainty"
+        t["use_uncertainty"] = False
+        t["use_boundary"]    = True
+        t["use_scheduler"]   = True
+    else:
+        t["use_uncertainty"] = True
+        t["use_boundary"]    = True
+        t["use_scheduler"]   = True
+
+    # Separate checkpoint and output dirs per run so they never overwrite each other
+    t["checkpoint_dir"] = f"checkpoints/finetune_{run_name}"
+
     davis_root = cfg["data"]["davis_root"]
-    ckpt_dir = Path(cfg["training"].get("checkpoint_dir", "checkpoints/finetune"))
-    output_dir = Path(cfg["evaluation"]["output_dir"]) / "finetune"
+    ckpt_dir = Path(t["checkpoint_dir"])
+    output_dir = Path(cfg["evaluation"]["output_dir"]) / f"finetune_{run_name}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)

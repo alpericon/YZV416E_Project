@@ -14,7 +14,7 @@ for gradient computation. Each step = one (frame, mask, prompt) triplet.
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -64,17 +64,75 @@ def iou_loss(pred_iou: torch.Tensor, logits: torch.Tensor,
     return F.mse_loss(pred_iou, true_iou.view_as(pred_iou))
 
 
-def combined_loss(logits, pred_iou, targets, cfg: dict) -> torch.Tensor:
-    w = cfg.get("training", {})
-    focal_w = w.get("focal_loss_weight", 20.0)
-    dice_w = w.get("dice_loss_weight", 1.0)
-    iou_w = w.get("iou_loss_weight", 1.0)
-
-    loss = focal_w * focal_loss(logits, targets)
-    loss = loss + dice_w * dice_loss(logits, targets)
+def fixed_weight_loss(
+    logits: torch.Tensor,
+    pred_iou: Optional[torch.Tensor],
+    targets: torch.Tensor,
+    cfg: dict,
+    use_boundary: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Fixed-weight combination used by baseline and no-uncertainty runs."""
+    train_cfg = cfg.get("training", {})
+    indiv: Dict[str, torch.Tensor] = {
+        "focal": focal_loss(logits, targets),
+        "dice":  dice_loss(logits, targets),
+    }
+    if use_boundary:
+        indiv["boundary"] = boundary_loss(logits, targets)
     if pred_iou is not None:
-        loss = loss + iou_w * iou_loss(pred_iou, logits, targets)
-    return loss
+        indiv["iou"] = iou_loss(pred_iou, logits, targets)
+
+    weights = {
+        "focal":    train_cfg.get("focal_loss_weight", 20.0),
+        "dice":     train_cfg.get("dice_loss_weight", 1.0),
+        "boundary": 1.0,
+        "iou":      train_cfg.get("iou_loss_weight", 1.0),
+    }
+    total = sum(weights[k] * v for k, v in indiv.items())
+    return total, {k: v.item() for k, v in indiv.items()}
+
+
+def boundary_loss(logits: torch.Tensor, targets: torch.Tensor, kernel: int = 3) -> torch.Tensor:
+    """Boundary-aware loss using morphological erosion via max-pooling.
+    Penalises errors at mask edges to directly improve F-score."""
+    pred = torch.sigmoid(logits)
+    pad = kernel // 2
+    pred_eroded = -F.max_pool2d(-pred,   kernel, stride=1, padding=pad)
+    gt_eroded   = -F.max_pool2d(-targets, kernel, stride=1, padding=pad)
+    pred_boundary = (pred   - pred_eroded).clamp(0, 1)
+    gt_boundary   = (targets - gt_eroded).clamp(0, 1)
+    return F.binary_cross_entropy(pred_boundary, gt_boundary)
+
+
+def uncertainty_loss(
+    logits: torch.Tensor,
+    pred_iou: Optional[torch.Tensor],
+    targets: torch.Tensor,
+    log_vars: nn.ParameterDict,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Kendall et al. (CVPR 2018) homoscedastic uncertainty weighting.
+
+    Learns per-task log-variance s = log(σ²) alongside model weights.
+    Derived from maximising the Gaussian/softmax log-likelihood:
+      Classification terms (focal, dice, boundary): exp(-s)·L + 0.5·s
+      Regression term     (iou):                  0.5·exp(-s)·L + 0.5·s
+    The 0.5·s regulariser prevents σ→∞ (i.e. ignoring the task).
+    """
+    indiv: Dict[str, torch.Tensor] = {
+        "focal":    focal_loss(logits, targets),
+        "dice":     dice_loss(logits, targets),
+        "boundary": boundary_loss(logits, targets),
+    }
+    if pred_iou is not None:
+        indiv["iou"] = iou_loss(pred_iou, logits, targets)
+
+    total = sum(
+        (0.5 * torch.exp(-log_vars[k]) * v + 0.5 * log_vars[k])  # regression
+        if k == "iou" else
+        (torch.exp(-log_vars[k]) * v + 0.5 * log_vars[k])         # classification
+        for k, v in indiv.items()
+    )
+    return total, {k: v.item() for k, v in indiv.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -142,10 +200,11 @@ def train_step(
     gt_mask: np.ndarray,
     optimizer: torch.optim.Optimizer,
     cfg: dict,
+    log_vars: Optional[nn.ParameterDict],
     prompt_type: str = "box",
     grad_accum_step: int = 1,
     grad_accum_total: int = 1,
-) -> float:
+) -> Tuple[float, Dict[str, float]]:
     """
     One gradient step on a single (frame, mask) pair.
 
@@ -203,19 +262,32 @@ def train_step(
     # low_res_masks: (1, 1, 256, 256)   iou_predictions: (1, 1)
 
     # ---- 5. Loss & backward ------------------------------------------------
-    loss = combined_loss(low_res_masks, iou_predictions, gt_tensor, cfg)
+    train_cfg = cfg.get("training", {})
+    use_uncertainty = train_cfg.get("use_uncertainty", True)
+    use_boundary    = train_cfg.get("use_boundary", True)
+
+    if use_uncertainty and log_vars is not None:
+        loss, loss_components = uncertainty_loss(
+            low_res_masks, iou_predictions, gt_tensor, log_vars
+        )
+    else:
+        loss, loss_components = fixed_weight_loss(
+            low_res_masks, iou_predictions, gt_tensor, cfg, use_boundary=use_boundary
+        )
+
     loss = loss / grad_accum_total
     loss.backward()
 
     if grad_accum_step == grad_accum_total:
-        max_norm = cfg.get("training", {}).get("max_grad_norm", 1.0)
-        nn.utils.clip_grad_norm_(
-            [p for p in predictor.model.parameters() if p.requires_grad], max_norm
-        )
+        max_norm = train_cfg.get("max_grad_norm", 1.0)
+        all_params = [p for p in predictor.model.parameters() if p.requires_grad]
+        if log_vars:
+            all_params += list(log_vars.parameters())
+        nn.utils.clip_grad_norm_(all_params, max_norm)
         optimizer.step()
         optimizer.zero_grad()
 
-    return loss.item() * grad_accum_total
+    return loss.item() * grad_accum_total, loss_components
 
 
 # ---------------------------------------------------------------------------
@@ -255,14 +327,29 @@ def train(cfg: dict) -> None:
     # Freeze backbone
     freeze_backbone(predictor.model)
 
-    # Optimizer
+    train_cfg = cfg.get("training", {})
+    use_uncertainty = train_cfg.get("use_uncertainty", True)
+    use_scheduler   = train_cfg.get("use_scheduler", True)
+
     trainable_params = get_trainable_parameters(predictor.model, cfg)
     if not trainable_params:
         raise RuntimeError("No trainable parameters found. Check config.trainable_modules.")
 
-    train_cfg = cfg.get("training", {})
+    # Learnable log-variances (only for uncertainty runs)
+    if use_uncertainty:
+        log_var_keys = ["focal", "dice", "boundary", "iou"]
+        log_vars: Optional[nn.ParameterDict] = nn.ParameterDict({
+            k: nn.Parameter(torch.zeros(1, device=device)) for k in log_var_keys
+        })
+        print("Uncertainty log-variances initialised at 0 for:", log_var_keys)
+        opt_params = list(trainable_params) + list(log_vars.parameters())
+    else:
+        log_vars = None
+        opt_params = list(trainable_params)
+        print("Fixed-weight loss (uncertainty weighting disabled).")
+
     optimizer = torch.optim.AdamW(
-        trainable_params,
+        opt_params,
         lr=train_cfg.get("learning_rate", 1e-4),
         weight_decay=train_cfg.get("weight_decay", 1e-4),
     )
@@ -272,6 +359,24 @@ def train(cfg: dict) -> None:
     save_every = train_cfg.get("save_every_n_epochs", 2)
     ckpt_dir = Path(train_cfg.get("checkpoint_dir", "checkpoints/finetune"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # LR scheduler: linear warmup → cosine annealing (optional)
+    if use_scheduler:
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+        total_steps  = len(train_loader) * num_epochs
+        warmup_steps = train_cfg.get("warmup_steps", 100)
+        warmup_sched = LinearLR(optimizer, start_factor=0.1, end_factor=1.0,
+                                total_iters=warmup_steps)
+        cosine_sched = CosineAnnealingLR(optimizer,
+                                         T_max=max(total_steps - warmup_steps, 1),
+                                         eta_min=1e-6)
+        scheduler = SequentialLR(optimizer,
+                                 schedulers=[warmup_sched, cosine_sched],
+                                 milestones=[warmup_steps])
+        print(f"Scheduler: {warmup_steps} warmup steps → cosine decay over {total_steps} total steps.")
+    else:
+        scheduler = None
+        print("Constant LR (scheduler disabled).")
 
     writer = SummaryWriter(log_dir=str(ckpt_dir / "tensorboard"))
     global_step = 0
@@ -297,12 +402,15 @@ def train(cfg: dict) -> None:
                     frames_out, masks_out = aug([frame_aug], [mask_aug])
                     frame_aug, mask_aug = frames_out[0], masks_out[0]
 
-                loss_val = train_step(
+                loss_val, loss_components = train_step(
                     predictor, frame_aug, mask_aug, optimizer, cfg,
+                    log_vars=log_vars,
                     prompt_type="box",
                     grad_accum_step=accum_step,
                     grad_accum_total=grad_accum,
                 )
+                if accum_step == grad_accum and scheduler is not None:
+                    scheduler.step()
             except Exception as e:
                 print(f"[WARN] Skipping sample: {e}")
                 continue
@@ -310,7 +418,19 @@ def train(cfg: dict) -> None:
             epoch_loss += loss_val
             global_step += 1
             pbar.set_postfix(loss=f"{loss_val:.4f}")
+
+            # Per-step TensorBoard logging
+            current_lr = (
+                scheduler.get_last_lr()[0] if scheduler is not None
+                else train_cfg.get("learning_rate", 1e-4)
+            )
             writer.add_scalar("train/loss", loss_val, global_step)
+            writer.add_scalar("train/lr", current_lr, global_step)
+            for k, v in loss_components.items():
+                writer.add_scalar(f"train/loss_{k}", v, global_step)
+            if log_vars:
+                for k in log_vars:
+                    writer.add_scalar(f"train/log_var_{k}", log_vars[k].item(), global_step)
 
         mean_loss = epoch_loss / max(len(train_dataset), 1)
         print(f"Epoch {epoch} — mean loss: {mean_loss:.6f}")
@@ -323,12 +443,17 @@ def train(cfg: dict) -> None:
                     "epoch": epoch,
                     "model_state_dict": predictor.model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "log_vars": {k: v.item() for k, v in log_vars.items()} if log_vars else {},
                     "loss": mean_loss,
                     "cfg": cfg,
                 },
                 ckpt_path,
             )
-            print(f"Checkpoint saved: {ckpt_path}")
+            if log_vars:
+                learned = {k: f"{v.item():.3f}" for k, v in log_vars.items()}
+                print(f"Checkpoint saved: {ckpt_path}  |  log_vars: {learned}")
+            else:
+                print(f"Checkpoint saved: {ckpt_path}")
 
     writer.close()
     print("\nFine-tuning complete.")
