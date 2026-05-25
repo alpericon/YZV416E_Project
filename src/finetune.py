@@ -298,7 +298,12 @@ def train(cfg: dict) -> None:
     """Run the full fine-tuning loop."""
     from .inference import load_sam2_image_predictor
 
-    device = cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    device = cfg.get("device", "cuda" if num_gpus > 0 else "cpu")
+    print(f"  Training device : {device}  ({num_gpus} GPU(s) available)")
+    if num_gpus > 1:
+        print(f"  Multi-GPU note  : inference will distribute sequences across "
+              f"all {num_gpus} GPUs automatically.")
     seed = cfg.get("seed", 42)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -471,9 +476,13 @@ def load_finetuned_predictor(cfg: dict, checkpoint_path: str):
     device = cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
     predictor = load_sam2_video_predictor(cfg)
     ckpt = torch.load(checkpoint_path, map_location=device)
+    state_dict = ckpt["model_state_dict"]
+    # Strip DataParallel 'module.' prefix if the checkpoint was saved from a wrapped model
+    if state_dict and all(k.startswith("module.") for k in state_dict):
+        state_dict = {k[7:]: v for k, v in state_dict.items()}
     # SAM2VideoPredictor IS the model (extends SAM2Base directly), so load
     # into predictor itself — not predictor.model as in SAM2ImagePredictor.
-    predictor.load_state_dict(ckpt["model_state_dict"])
+    predictor.load_state_dict(state_dict)
     predictor.to(device)
     print(f"Loaded fine-tuned checkpoint: {checkpoint_path}  (epoch {ckpt['epoch']})")
     return predictor

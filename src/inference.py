@@ -12,6 +12,7 @@ Usage:
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -169,6 +170,24 @@ def run_inference_on_sequence(
 # Full dataset inference
 # ---------------------------------------------------------------------------
 
+def _infer_sequences_on_device(
+    predictor,
+    sequences: list,
+    prompt_type: str,
+    gpu_id: int,
+) -> Dict[str, Dict]:
+    """Run inference for a subset of sequences on a single device."""
+    results = {}
+    for seq in tqdm(sequences, desc=f"  cuda:{gpu_id}", leave=False):
+        try:
+            pred = run_inference_on_sequence(predictor, seq, prompt_type=prompt_type)
+            results[seq.name] = pred
+        except Exception as e:
+            print(f"\n[WARN cuda:{gpu_id}] Skipping {seq.name}: {e}")
+            results[seq.name] = {}
+    return results
+
+
 def run_zero_shot_on_dataset(
     predictor,
     davis_root: str,
@@ -178,22 +197,57 @@ def run_zero_shot_on_dataset(
 ) -> Dict[str, Dict[int, List[np.ndarray]]]:
     """
     Run zero-shot inference over the full DAVIS split.
+    Automatically distributes sequences across all available GPUs when cfg is provided.
 
     Returns:
         {seq_name: {obj_id: [binary_mask_per_frame]}}
     """
     dataset = DAVISDataset(davis_root, split=split)
-    results = {}
+    sequences = dataset.sequences
 
-    for seq in tqdm(dataset.sequences, desc=f"Inference [{split}]"):
-        try:
-            pred = run_inference_on_sequence(predictor, seq, prompt_type=prompt_type)
-            results[seq.name] = pred
-        except Exception as e:
-            print(f"[WARN] Skipping {seq.name}: {e}")
-            results[seq.name] = {}
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    configured_device = cfg.get("device", "cpu") if cfg else "cpu"
+    use_multi_gpu = num_gpus > 1 and "cuda" in str(configured_device) and cfg is not None
 
-    return results
+    if not use_multi_gpu:
+        results = {}
+        for seq in tqdm(sequences, desc=f"Inference [{split}]"):
+            try:
+                pred = run_inference_on_sequence(predictor, seq, prompt_type=prompt_type)
+                results[seq.name] = pred
+            except Exception as e:
+                print(f"[WARN] Skipping {seq.name}: {e}")
+                results[seq.name] = {}
+        return results
+
+    # Multi-GPU: one predictor per GPU, sequences distributed round-robin
+    print(f"  Multi-GPU inference: {num_gpus} GPUs, {len(sequences)} sequences.")
+    predictors = [predictor]  # GPU 0 uses the already-loaded predictor
+    for gpu_id in range(1, num_gpus):
+        gpu_cfg = {**cfg, "device": f"cuda:{gpu_id}"}
+        p = load_sam2_video_predictor(gpu_cfg)
+        predictors.append(p)
+        print(f"  Loaded predictor on cuda:{gpu_id}.")
+
+    partitions = [sequences[i::num_gpus] for i in range(num_gpus)]
+
+    all_results: Dict[str, Dict] = {}
+    with ThreadPoolExecutor(max_workers=num_gpus) as executor:
+        futures = {
+            executor.submit(_infer_sequences_on_device, p, seqs, prompt_type, gid): gid
+            for gid, (p, seqs) in enumerate(zip(predictors, partitions))
+            if seqs
+        }
+        for future in tqdm(as_completed(futures), total=len(futures),
+                           desc=f"Inference [{split}] (multi-GPU)", position=0):
+            try:
+                all_results.update(future.result())
+            except Exception as e:
+                gid = futures[future]
+                print(f"\n[WARN] GPU {gid} inference failed: {e}")
+
+    # Restore original sequence order
+    return {seq.name: all_results.get(seq.name, {}) for seq in sequences}
 
 
 # ---------------------------------------------------------------------------
