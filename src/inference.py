@@ -77,8 +77,7 @@ def load_sam2_image_predictor(cfg: dict):
         model = build_sam2(config, checkpoint, device=device)
     else:
         hf_id = model_cfg.get("hf_model_id", "facebook/sam2-hiera-base-plus")
-        model = build_sam2(config, "", device=device)  # will try HF internally
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
+        print(f"Checkpoint not found locally. Loading from HuggingFace: {hf_id}")
         return SAM2ImagePredictor.from_pretrained(hf_id, device=device)
 
     return SAM2ImagePredictor(model)

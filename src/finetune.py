@@ -3,8 +3,8 @@ Fine-tuning SAM 2 on DAVIS 2017 using a frozen backbone (MedSAM-style adaptation
 
 Strategy:
     - Freeze: image encoder (Hiera ViT backbone)
-    - Train:  memory_attention, sam_mask_decoder
-    - Loss:   Focal + Dice (+ IoU prediction)
+    - Train:  sam_mask_decoder (configurable via training.trainable_modules)
+    - Loss:   Focal + Dice + Boundary + IoU prediction (weights or uncertainty)
     - Inputs: single annotated frames from DAVIS training set
 
 Training loop uses SAM2ImagePredictor which gives direct access to the model
@@ -99,7 +99,7 @@ def boundary_loss(logits: torch.Tensor, targets: torch.Tensor, kernel: int = 3) 
     pad = kernel // 2
     pred_eroded = -F.max_pool2d(-pred,   kernel, stride=1, padding=pad)
     gt_eroded   = -F.max_pool2d(-targets, kernel, stride=1, padding=pad)
-    pred_boundary = (pred   - pred_eroded).clamp(0, 1)
+    pred_boundary = (pred   - pred_eroded).clamp(1e-6, 1 - 1e-6)
     gt_boundary   = (targets - gt_eroded).clamp(0, 1)
     return F.binary_cross_entropy(pred_boundary, gt_boundary)
 

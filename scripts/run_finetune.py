@@ -4,7 +4,7 @@ Fine-tune SAM 2 on DAVIS 2017 training set, then evaluate on validation set.
 Usage:
     python scripts/run_finetune.py
     python scripts/run_finetune.py --config configs/config.yaml --epochs 10
-    python scripts/run_finetune.py --eval-only --checkpoint checkpoints/finetune/sam2_finetune_epoch010.pt
+    python scripts/run_finetune.py --eval-only --checkpoint checkpoints/finetune_improved/sam2_finetune_epoch010.pt
 """
 
 import argparse

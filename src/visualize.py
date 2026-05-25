@@ -75,8 +75,9 @@ def overlay_mask_on_frame(
             contours, _ = cv2.findContours(
                 mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
-            cv2.drawContours(out.astype(np.uint8), contours, -1,
-                             get_color(obj_id), 2)
+            out_uint8 = out.astype(np.uint8)
+            cv2.drawContours(out_uint8, contours, -1, get_color(obj_id), 2)
+            out = out_uint8.astype(np.float32)
 
     return out.astype(np.uint8)
 

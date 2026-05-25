@@ -12,6 +12,7 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import yaml
 
 # Add project root to path
@@ -150,5 +151,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import numpy as np  # needed for worst_seq fallback
     main()
