@@ -254,6 +254,30 @@ def run_zero_shot_on_dataset(
 # Save / load predictions
 # ---------------------------------------------------------------------------
 
+def _davis_palette() -> List[int]:
+    """Standard PASCAL VOC / DAVIS color palette as a flat [r,g,b,...] list.
+
+    Index 0 -> (0,0,0) background, 1 -> (128,0,0), 2 -> (0,128,0), etc.
+    Without this palette, index masks (pixel values 1,2,3) render near-black.
+    """
+    palette = [0] * (256 * 3)
+    for i in range(256):
+        r = g = b = 0
+        c = i
+        for j in range(8):
+            r |= ((c >> 0) & 1) << (7 - j)
+            g |= ((c >> 1) & 1) << (7 - j)
+            b |= ((c >> 2) & 1) << (7 - j)
+            c >>= 3
+        palette[i * 3 + 0] = r
+        palette[i * 3 + 1] = g
+        palette[i * 3 + 2] = b
+    return palette
+
+
+_DAVIS_PALETTE = _davis_palette()
+
+
 def save_predictions(
     predictions: Dict[str, Dict[int, List[np.ndarray]]],
     output_dir: str,
@@ -283,6 +307,7 @@ def save_predictions(
                     combined[masks[f_idx].astype(bool)] = obj_id
 
             pil = Image.fromarray(combined, mode="P")
+            pil.putpalette(_DAVIS_PALETTE)
             pil.save(seq_dir / f"{f_idx:05d}.png")
 
 
