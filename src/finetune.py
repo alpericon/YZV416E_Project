@@ -165,9 +165,13 @@ def apply_freezing(model, cfg: dict) -> None:
 
 
 def get_trainable_parameters(model, cfg: dict) -> List[nn.Parameter]:
-    """Return parameters of modules listed in cfg.training.trainable_modules."""
+    """Return parameters of modules listed in cfg.training.trainable_modules.
+
+    Only parameters with requires_grad=True are returned, so this always agrees
+    with apply_freezing() regardless of the default.
+    """
     trainable_modules = cfg.get("training", {}).get(
-        "trainable_modules", ["memory_attention", "sam_mask_decoder"]
+        "trainable_modules", ["sam_mask_decoder"]
     )
     params = []
     for module_name in trainable_modules:
@@ -175,9 +179,10 @@ def get_trainable_parameters(model, cfg: dict) -> List[nn.Parameter]:
         if module is None:
             print(f"[WARN] Module '{module_name}' not found in model — skipping.")
             continue
-        count = sum(p.numel() for p in module.parameters())
+        mod_params = [p for p in module.parameters() if p.requires_grad]
+        count = sum(p.numel() for p in mod_params)
         print(f"  Trainable: {module_name} ({count:,} parameters)")
-        params.extend(module.parameters())
+        params.extend(mod_params)
     return params
 
 
