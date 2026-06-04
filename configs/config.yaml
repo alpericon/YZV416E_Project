@@ -27,8 +27,17 @@ augmentation:
   motion_blur_prob: 0.3       # probability of applying motion blur
 
 training:
-  # Which layers to train (backbone is always frozen)
+  # Which layers to train (backbone is always frozen).
+  # - [sam_mask_decoder]                      → decoder only (image mode)
+  # - [memory_attention, sam_mask_decoder]    → attention + decoder (needs train_mode: video)
   trainable_modules: [sam_mask_decoder]
+  # Training mode:
+  # - image : single-frame decoder fine-tuning (memory attention NOT trained)
+  # - video : frame-pair training; predicts frame 1 through memory attention,
+  #           so memory_attention actually receives gradients.
+  train_mode: image
+  frame_gap: 5                  # video mode: max gap between conditioning and target frame
+  pairs_per_object: 8           # video mode: frame pairs sampled per (sequence, object) each epoch
   learning_rate: 1.0e-4
   weight_decay: 1.0e-4
   num_epochs: 10

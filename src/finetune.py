@@ -146,6 +146,24 @@ def freeze_backbone(model) -> None:
     print("Image encoder frozen.")
 
 
+def apply_freezing(model, cfg: dict) -> None:
+    """Freeze every parameter except those in cfg.training.trainable_modules.
+
+    Stricter than freeze_backbone: ensures only the requested modules
+    (e.g. sam_mask_decoder, optionally memory_attention) receive gradients,
+    so the optimizer's param list and requires_grad flags stay consistent.
+    """
+    trainable = set(cfg.get("training", {}).get("trainable_modules", ["sam_mask_decoder"]))
+    n_train = 0
+    for name, p in model.named_parameters():
+        top = name.split(".")[0]
+        p.requires_grad = top in trainable
+        if p.requires_grad:
+            n_train += p.numel()
+    print(f"Freezing applied. Trainable modules: {sorted(trainable)}  "
+          f"({n_train:,} trainable parameters)")
+
+
 def get_trainable_parameters(model, cfg: dict) -> List[nn.Parameter]:
     """Return parameters of modules listed in cfg.training.trainable_modules."""
     trainable_modules = cfg.get("training", {}).get(
@@ -192,6 +210,27 @@ def _encode_image_no_grad(predictor, frame: np.ndarray, device: torch.device):
         feats[:-1],   # high_res_feats  [(1,C,256,256), (1,C,128,128)]
         orig_hw,
     )
+
+
+def _encode_image_feats(predictor, frame: np.ndarray, device: torch.device):
+    """
+    Run the frozen image encoder and return the raw multi-scale feature lists
+    needed by SAM2Base.track_step (video / memory-conditioned forward).
+
+    Unlike _encode_image_no_grad, this does NOT add no_mem_embed — track_step
+    handles memory conditioning (and the no-mem path for the init frame) itself.
+
+    Returns:
+        vision_feats, vision_pos_embeds, feat_sizes, orig_hw
+    """
+    input_tensor = predictor._transforms(frame).unsqueeze(0).to(device)  # (1,3,H,W)
+    orig_hw = frame.shape[:2]
+    with torch.no_grad():
+        backbone_out = predictor.model.forward_image(input_tensor)
+        _, vision_feats, vision_pos_embeds, feat_sizes = (
+            predictor.model._prepare_backbone_features(backbone_out)
+        )
+    return vision_feats, vision_pos_embeds, feat_sizes, orig_hw
 
 
 def train_step(
@@ -290,6 +329,121 @@ def train_step(
     return loss.item() * grad_accum_total, loss_components
 
 
+def train_step_video(
+    predictor,
+    sample: dict,
+    optimizer: torch.optim.Optimizer,
+    cfg: dict,
+    log_vars: Optional[nn.ParameterDict],
+    grad_accum_step: int = 1,
+    grad_accum_total: int = 1,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    One gradient step on a (frame0 -> frame1) pair, training the memory
+    attention + mask decoder together.
+
+    Pipeline (mirrors SAM2's video tracking):
+      1. Frame 0 (conditioning, no grad): box prompt from GT mask 0, run
+         track_step(is_init_cond_frame=True) and the memory encoder to build a
+         memory feature for the object.
+      2. Frame 1 (target, with grad): run track_step(is_init_cond_frame=False)
+         with NO prompt, so the prediction flows through `memory_attention`
+         (conditioned on frame 0's memory) and the mask decoder.
+      3. Loss on frame 1's predicted mask vs GT mask 1.
+
+    Gradients reach `memory_attention` and `sam_mask_decoder` (whichever are
+    unfrozen). The image encoder runs under no_grad (frozen). Frame 0 runs
+    entirely under no_grad, so its memory acts as a fixed conditioning signal.
+    """
+    import cv2
+
+    model = predictor.model
+    device = next(model.parameters()).device
+    train_cfg = cfg.get("training", {})
+
+    frame0, mask0 = sample["frame0"], sample["mask0"].astype(np.uint8)
+    frame1, mask1 = sample["frame1"], sample["mask1"].astype(np.uint8)
+    if int(mask0.sum()) == 0:
+        raise ValueError("empty conditioning mask — skipping pair")
+
+    autocast_dtype = torch.bfloat16
+    with torch.autocast("cuda" if torch.cuda.is_available() else "cpu", dtype=autocast_dtype):
+        # ---- Frame 0: conditioning frame, no grad, builds memory -----------
+        with torch.no_grad():
+            vf0, vpe0, fs0, orig_hw = _encode_image_feats(predictor, frame0, device)
+
+            box_np = mask_to_box(mask0)  # [x1,y1,x2,y2] in original space
+            box_t = torch.as_tensor(box_np, dtype=torch.float, device=device).unsqueeze(0)
+            box_t = predictor._transforms.transform_boxes(
+                box_t, normalize=True, orig_hw=orig_hw
+            )  # (1, 2, 2)
+            pt_labels = torch.tensor([[2, 3]], dtype=torch.int, device=device)  # box corners
+            point_inputs0 = {"point_coords": box_t, "point_labels": pt_labels}
+
+            output_dict = {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
+            out0 = model.track_step(
+                frame_idx=0,
+                is_init_cond_frame=True,
+                current_vision_feats=vf0,
+                current_vision_pos_embeds=vpe0,
+                feat_sizes=fs0,
+                point_inputs=point_inputs0,
+                mask_inputs=None,
+                output_dict=output_dict,
+                num_frames=2,
+                run_mem_encoder=True,
+            )
+            output_dict["cond_frame_outputs"][0] = out0
+
+        # ---- Frame 1: target frame, WITH grad through memory attention ------
+        vf1, vpe1, fs1, _ = _encode_image_feats(predictor, frame1, device)
+        out1 = model.track_step(
+            frame_idx=1,
+            is_init_cond_frame=False,
+            current_vision_feats=vf1,
+            current_vision_pos_embeds=vpe1,
+            feat_sizes=fs1,
+            point_inputs=None,     # no prompt -> rely on memory attention
+            mask_inputs=None,
+            output_dict=output_dict,
+            num_frames=2,
+            run_mem_encoder=False,
+        )
+
+    low_res_masks = out1["pred_masks"].float()  # (1, 1, 256, 256)
+
+    # Build GT mask at decoder output resolution (256x256)
+    low_res_size = model.image_size // 4
+    gt_lr = cv2.resize(
+        mask1, (low_res_size, low_res_size), interpolation=cv2.INTER_NEAREST
+    )
+    gt_tensor = torch.from_numpy(gt_lr).float().unsqueeze(0).unsqueeze(0).to(device)
+
+    # Loss (no IoU-prediction term in video mode — track_step doesn't expose it)
+    use_uncertainty = train_cfg.get("use_uncertainty", True)
+    use_boundary = train_cfg.get("use_boundary", True)
+    if use_uncertainty and log_vars is not None:
+        loss, loss_components = uncertainty_loss(low_res_masks, None, gt_tensor, log_vars)
+    else:
+        loss, loss_components = fixed_weight_loss(
+            low_res_masks, None, gt_tensor, cfg, use_boundary=use_boundary
+        )
+
+    loss = loss / grad_accum_total
+    loss.backward()
+
+    if grad_accum_step == grad_accum_total:
+        max_norm = train_cfg.get("max_grad_norm", 1.0)
+        all_params = [p for p in model.parameters() if p.requires_grad]
+        if log_vars:
+            all_params += list(log_vars.parameters())
+        nn.utils.clip_grad_norm_(all_params, max_norm)
+        optimizer.step()
+        optimizer.zero_grad()
+
+    return loss.item() * grad_accum_total, loss_components
+
+
 # ---------------------------------------------------------------------------
 # Full training loop
 # ---------------------------------------------------------------------------
@@ -308,14 +462,32 @@ def train(cfg: dict) -> None:
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # Build datasets
-    aug = build_train_augmentation(cfg)
+    # Training mode: "image" (single-frame decoder) or "video" (frame-pair,
+    # also trains memory attention).
+    train_mode = cfg.get("training", {}).get("train_mode", "image")
+    print(f"  Training mode   : {train_mode}")
 
-    train_dataset = DAVISFrameDataset(
-        cfg["data"]["davis_root"],
-        split=cfg["data"].get("train_split", "train"),
-        transform=None,
-    )
+    # Build datasets
+    aug = build_train_augmentation(cfg) if train_mode == "image" else None
+
+    if train_mode == "video":
+        from .dataset import DAVISPairDataset
+        frame_gap = cfg.get("training", {}).get("frame_gap", 5)
+        pairs_per_object = cfg.get("training", {}).get("pairs_per_object", 8)
+        train_dataset = DAVISPairDataset(
+            cfg["data"]["davis_root"],
+            split=cfg["data"].get("train_split", "train"),
+            frame_gap=frame_gap,
+            pairs_per_object=pairs_per_object,
+        )
+        print(f"  Video pairs     : {len(train_dataset)} samples/epoch "
+              f"(frame_gap={frame_gap}, pairs_per_object={pairs_per_object})")
+    else:
+        train_dataset = DAVISFrameDataset(
+            cfg["data"]["davis_root"],
+            split=cfg["data"].get("train_split", "train"),
+            transform=None,
+        )
 
     train_loader = DataLoader(
         train_dataset, batch_size=1, shuffle=True, num_workers=0,
@@ -326,8 +498,8 @@ def train(cfg: dict) -> None:
     predictor = load_sam2_image_predictor(cfg)
     predictor.model.to(device)
 
-    # Freeze backbone
-    freeze_backbone(predictor.model)
+    # Freeze everything except the configured trainable modules
+    apply_freezing(predictor.model, cfg)
 
     train_cfg = cfg.get("training", {})
     use_uncertainty = train_cfg.get("use_uncertainty", True)
@@ -395,24 +567,30 @@ def train(cfg: dict) -> None:
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}")
 
         for sample in pbar:
-            frame = sample["frame"]
-            mask = sample["mask"]
             accum_step = (accum_step % grad_accum) + 1
 
             try:
-                # Apply augmentations inline (they're not in the DataLoader)
-                frame_aug, mask_aug = frame, mask
-                if aug is not None:
-                    frames_out, masks_out = aug([frame_aug], [mask_aug])
-                    frame_aug, mask_aug = frames_out[0], masks_out[0]
+                if train_mode == "video":
+                    loss_val, loss_components = train_step_video(
+                        predictor, sample, optimizer, cfg,
+                        log_vars=log_vars,
+                        grad_accum_step=accum_step,
+                        grad_accum_total=grad_accum,
+                    )
+                else:
+                    # Apply augmentations inline (they're not in the DataLoader)
+                    frame_aug, mask_aug = sample["frame"], sample["mask"]
+                    if aug is not None:
+                        frames_out, masks_out = aug([frame_aug], [mask_aug])
+                        frame_aug, mask_aug = frames_out[0], masks_out[0]
 
-                loss_val, loss_components = train_step(
-                    predictor, frame_aug, mask_aug, optimizer, cfg,
-                    log_vars=log_vars,
-                    prompt_type="box",
-                    grad_accum_step=accum_step,
-                    grad_accum_total=grad_accum,
-                )
+                    loss_val, loss_components = train_step(
+                        predictor, frame_aug, mask_aug, optimizer, cfg,
+                        log_vars=log_vars,
+                        prompt_type="box",
+                        grad_accum_step=accum_step,
+                        grad_accum_total=grad_accum,
+                    )
                 if accum_step == grad_accum and scheduler is not None:
                     scheduler.step()
             except Exception as e:

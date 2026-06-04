@@ -164,6 +164,59 @@ class DAVISFrameDataset(Dataset):
         }
 
 
+class DAVISPairDataset(Dataset):
+    """
+    Frame-pair dataset for video (memory-conditioned) fine-tuning.
+
+    Each item is a (conditioning_frame, target_frame) pair from the same
+    sequence and the same object. The target frame is sampled 1..frame_gap
+    frames after the conditioning frame, so training exercises SAM 2's
+    memory attention (frame 1 is predicted from frame 0's memory).
+    """
+
+    def __init__(
+        self,
+        davis_root: str,
+        split: str = "train",
+        resolution: str = "480p",
+        frame_gap: int = 5,
+        pairs_per_object: int = 8,
+    ):
+        self.frame_gap = max(1, int(frame_gap))
+        seq_dataset = DAVISDataset(davis_root, split, resolution)
+        # One base unit per (sequence, object). Frames are sampled per call, so
+        # repeating each unit `pairs_per_object` times yields many distinct pairs
+        # per epoch (otherwise DAVIS train gives only ~150 units total).
+        base: List[Tuple[DAVISSequence, int]] = []
+        for seq in seq_dataset.sequences:
+            if len(seq) < 2:
+                continue
+            for obj_id in seq.object_ids:
+                base.append((seq, obj_id))
+        self.samples: List[Tuple[DAVISSequence, int]] = base * max(1, int(pairs_per_object))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict:
+        seq, obj_id = self.samples[idx]
+        n = len(seq)
+
+        # Conditioning frame, then a target frame up to frame_gap ahead.
+        f0 = int(np.random.randint(0, n - 1))
+        gap = int(np.random.randint(1, self.frame_gap + 1))
+        f1 = min(n - 1, f0 + gap)
+
+        return {
+            "sequence_name": seq.name,
+            "obj_id": obj_id,
+            "frame0": seq.load_frame(f0),
+            "mask0": seq.load_binary_mask(f0, obj_id).astype(np.uint8),
+            "frame1": seq.load_frame(f1),
+            "mask1": seq.load_binary_mask(f1, obj_id).astype(np.uint8),
+        }
+
+
 def get_gt_masks_for_evaluation(
     davis_root: str,
     split: str = "val",
